@@ -21,7 +21,7 @@ env:
 
 jobs:
   bridge:
-    name: Generate flutter_rust_bridge (Flutter ${{ env.BRIDGE_FLUTTER_VERSION }})
+    name: Generate flutter_rust_bridge (Flutter 3.22.3)
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout source code
