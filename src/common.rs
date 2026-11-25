@@ -2515,7 +2515,40 @@ pub fn rustdesk_interval(i: Interval) -> ThrottledInterval {
     ThrottledInterval::new(i)
 }
 
+/// 内置服务器配置（厂商构建时注入）。
+///
+/// 取值来自自定义客户端配置串，该串为「JSON 反转 + URL-safe Base64」编码：
+/// {"host":"...","relay":"...","api":"...","key":"..."}
+/// 这里写入的是解码后的明文，不保留原始编码串，便于审计。
+pub const EMBEDDED_SERVER_HOST: &str = "rustdesk.youdatasum.com";
+pub const EMBEDDED_SERVER_RELAY: &str = "rustdesk.youdatasum.com";
+pub const EMBEDDED_SERVER_API: &str = "";
+pub const EMBEDDED_SERVER_KEY: &str = "umAKFFr2H+UwwCZZzMlL+wIS1kfhlMygCwNroADr8Wc=";
+
+/// 把内置服务器配置写入 `DEFAULT_SETTINGS`。
+///
+/// 优先级说明：`Config::get_option` 的查找顺序是
+/// OVERWRITE_SETTINGS > 用户配置文件(CONFIG2.options) > DEFAULT_SETTINGS，
+/// 因此这里写入的值是「出厂默认值」：首次运行即生效，用户在
+/// 「设置 - 网络」里仍可自行修改。已存在的 custom.txt 配置会在
+/// `read_custom_client` 中覆盖同名字段。
+pub fn apply_embedded_server_config() {
+    let entries: [(&str, &str); 4] = [
+        ("custom-rendezvous-server", EMBEDDED_SERVER_HOST),
+        ("relay-server", EMBEDDED_SERVER_RELAY),
+        ("api-server", EMBEDDED_SERVER_API),
+        ("key", EMBEDDED_SERVER_KEY),
+    ];
+    let mut defaults = config::DEFAULT_SETTINGS.write().unwrap();
+    for (k, v) in entries {
+        if !v.is_empty() {
+            defaults.insert(k.to_owned(), v.to_owned());
+        }
+    }
+}
+
 pub fn load_custom_client() {
+    apply_embedded_server_config();
     #[cfg(debug_assertions)]
     if let Ok(data) = std::fs::read_to_string("./custom.txt") {
         read_custom_client(data.trim());

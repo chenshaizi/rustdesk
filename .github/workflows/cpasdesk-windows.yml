@@ -1,0 +1,221 @@
+name: CPASDesk Windows Build
+
+# 自建分支的 Windows x64 出包流水线。
+# 与上游 flutter-build.yml 的差别：去掉签名、SBOM、Release 发布、arm64 与 Sciter 任务，
+# 只保留 x64 Flutter 包所需的编译链，产物通过 workflow artifact 下载。
+on:
+  # 推到 master 即自动出包，不必再到网页点 Run workflow
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+env:
+  FLUTTER_VERSION: "3.24.5"
+  BRIDGE_FLUTTER_VERSION: "3.22.3"
+  SCITER_RUST_VERSION: "1.75"
+  LLVM_VERSION: "15.0.6"
+  CARGO_EXPAND_VERSION: "1.0.95"
+  FLUTTER_RUST_BRIDGE_VERSION: "1.80.1"
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+
+jobs:
+  bridge:
+    name: Generate flutter_rust_bridge (Flutter ${{ env.BRIDGE_FLUTTER_VERSION }})
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Apply CPASDesk submodule patch
+        shell: bash
+        run: |
+          # .gitattributes 为 `* text=auto`，Windows runner 以 CRLF 检出该 patch 时，
+          # 与子模块内 LF 的目标文件不匹配会使 git apply 直接失败，故先归一化行尾。
+          sed -i 's/\r$//' .github/patches/cpasdesk-app-name.patch
+          git -C libs/hbb_common apply ../../.github/patches/cpasdesk-app-name.patch
+          grep -n 'APP_NAME' libs/hbb_common/src/config.rs | head -3
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            clang cmake curl gcc git g++ libclang-dev libgtk-3-dev \
+            llvm-dev nasm ninja-build pkg-config wget
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.SCITER_RUST_VERSION }}
+
+      - name: Install flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.BRIDGE_FLUTTER_VERSION }}
+          cache: true
+
+      - name: Install flutter rust bridge deps
+        shell: bash
+        run: |
+          cargo install cargo-expand --version ${{ env.CARGO_EXPAND_VERSION }} --locked
+          cargo install flutter_rust_bridge_codegen --version ${{ env.FLUTTER_RUST_BRIDGE_VERSION }} --features "uuid" --locked
+          # extended_text 14 需要更新的 Dart，3.22.3 解析不了，降到 13
+          sed -i -e 's/extended_text: 14.0.0/extended_text: 13.0.0/g' flutter/pubspec.yaml
+          pushd flutter && flutter pub get && popd
+
+      - name: Run flutter rust bridge
+        run: |
+          ~/.cargo/bin/flutter_rust_bridge_codegen \
+            --rust-input ./src/flutter_ffi.rs \
+            --dart-output ./flutter/lib/generated_bridge.dart \
+            --c-output ./flutter/macos/Runner/bridge_generated.h
+          cp ./flutter/macos/Runner/bridge_generated.h ./flutter/ios/Runner/bridge_generated.h
+
+      - name: Upload bridge artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-artifact
+          path: |
+            ./src/bridge_generated.rs
+            ./src/bridge_generated.io.rs
+            ./flutter/lib/generated_bridge.dart
+            ./flutter/lib/generated_bridge.freezed.dart
+            ./flutter/macos/Runner/bridge_generated.h
+            ./flutter/ios/Runner/bridge_generated.h
+
+  windows-x64:
+    name: Build Windows x64
+    needs: [bridge]
+    runs-on: windows-2022
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # submodule 的改动不会随主仓库 checkout 过来，必须显式打补丁，
+      # 否则云端产物的 APP_NAME 仍是 RustDesk。
+      - name: Apply CPASDesk submodule patch
+        shell: bash
+        run: |
+          # .gitattributes 为 `* text=auto`，Windows runner 以 CRLF 检出该 patch 时，
+          # 与子模块内 LF 的目标文件不匹配会使 git apply 直接失败，故先归一化行尾。
+          sed -i 's/\r$//' .github/patches/cpasdesk-app-name.patch
+          git -C libs/hbb_common apply ../../.github/patches/cpasdesk-app-name.patch
+          grep -n 'APP_NAME' libs/hbb_common/src/config.rs | head -3
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@v4
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@v2.0.9
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: Install flutter
+        id: flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          architecture: x64
+
+      - name: Replace engine with rustdesk custom flutter engine
+        shell: pwsh
+        run: |
+          flutter doctor -v
+          flutter precache --windows
+          Invoke-WebRequest -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile windows-x64-release.zip
+          Expand-Archive -Path windows-x64-release.zip -DestinationPath windows-x64-release
+          $flutterRoot = "${{ steps.flutter.outputs.CACHE-PATH }}"
+          if (-not $flutterRoot) { $flutterRoot = "C:/hostedtoolcache/windows/flutter/stable-${{ env.FLUTTER_VERSION }}-x64" }
+          $engineDir = Join-Path $flutterRoot "bin/cache/artifacts/engine/windows-x64-release"
+          Write-Host "Engine dir: $engineDir"
+          Copy-Item -Path windows-x64-release/* -Destination $engineDir -Recurse -Force
+
+      - name: Patch flutter
+        shell: bash
+        run: |
+          FLUTTER_ROOT=$(dirname $(dirname $(which flutter)))
+          cp .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff "$FLUTTER_ROOT"
+          cd "$FLUTTER_ROOT"
+          git apply flutter_3.24.4_dropdown_menu_enableFilter.diff
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.SCITER_RUST_VERSION }}
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: windows-2022
+
+      - name: Setup vcpkg with GitHub Actions binary cache
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
+        shell: bash
+        run: |
+          if ! $VCPKG_ROOT/vcpkg install --triplet x64-windows-static \
+              --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r f; do
+              echo "$f:"; echo "======"; cat "$f"; echo "======"
+            done
+            exit 1
+          fi
+
+      - name: Build CPASDesk
+        shell: pwsh
+        run: |
+          python .\build.py --portable --flutter --skip-portable-pack --hwcodec --vram
+          if (-not (Test-Path ".\flutter\build\windows\x64\runner\Release\rustdesk.exe")) {
+            throw "build output missing: flutter/build/windows/x64/runner/Release/rustdesk.exe"
+          }
+          Move-Item ".\flutter\build\windows\x64\runner\Release" ".\CPASDesk"
+
+      - name: Report embedded config in binary
+        shell: pwsh
+        run: |
+          # 确认服务器配置真的编进了 DLL，而不是只在源码里
+          $bytes = [System.IO.File]::ReadAllBytes(".\CPASDesk\librustdesk.dll")
+          $text = [System.Text.Encoding]::ASCII.GetString($bytes)
+          foreach ($needle in @('rustdesk.youdatasum.com', 'umAKFFr2H+UwwCZZzMlL+wIS1kfhlMygCwNroADr8Wc=')) {
+            if ($text.Contains($needle)) { Write-Host "FOUND: $needle" }
+            else { throw "NOT FOUND in librustdesk.dll: $needle" }
+          }
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches.Groups[1].Value
+          $name = "CPASDesk-$version-x64"
+          Compress-Archive -Path ".\CPASDesk" -DestinationPath ".\$name.zip" -CompressionLevel Optimal
+          Get-Item ".\$name.zip" | Select-Object Name, Length
+          echo "ARTIFACT_NAME=$name" >> $env:GITHUB_ENV
+
+      - name: Upload zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ./${{ env.ARTIFACT_NAME }}.zip
+          if-no-files-found: error
